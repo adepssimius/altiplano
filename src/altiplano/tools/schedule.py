@@ -11,7 +11,8 @@ The model, in the order `plan` applies it:
 - A task's duration comes from `Estimate: N days` in its description. Anything else
   is one day. `Estimate: part of ...` marks a task that shares its parent's days.
 - Blocking relations are finish-to-start. A task starts the day after its latest
-  unfinished blocker ends, and never before the start date. A done task keeps its
+  unfinished blocker ends, and never before the start date. `Not before:
+  YYYY-MM-DD` in a description is a later floor for that task and its subtasks. A done task keeps its
   dates and constrains nothing.
 - A parent's blockers also hold back every subtask beneath it. A parent with open
   subtasks then spans them, from the earliest start to the latest end.
@@ -36,6 +37,7 @@ from altiplano.tools.tasks import _write_task
 _TAGS = re.compile(r"<[^>]+>")
 _ESTIMATE_DAYS = re.compile(r"Estimate:\s*(\d+)\s*days?", re.IGNORECASE)
 _ESTIMATE_PART_OF = re.compile(r"Estimate:\s*part of\b", re.IGNORECASE)
+_NOT_BEFORE = re.compile(r"Not before:\s*(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
 
 _DAY_START = time(9, 0)
 _DAY_END = time(17, 0)
@@ -72,6 +74,8 @@ class Plan:
     labels_removed: dict[int, list[int]]
     unchanged: int
     done: int
+    floors: dict[int, date] = field(default_factory=dict)
+    excluded: dict[int, str] = field(default_factory=dict)
     titles: dict[int, str] = field(default_factory=dict)
     identifiers: dict[int, str] = field(default_factory=dict)
     dates: dict[int, tuple[date, date]] = field(default_factory=dict)
@@ -89,6 +93,12 @@ def _parse_duration(description: str | None) -> int | None:
         return None
     m = _ESTIMATE_DAYS.search(text)
     return max(1, int(m.group(1))) if m else 1
+
+
+def _parse_floor(description: str | None) -> date | None:
+    """The `Not before: YYYY-MM-DD` date in a description, if it has one."""
+    m = _NOT_BEFORE.search(_plain(description))
+    return date.fromisoformat(m.group(1)) if m else None
 
 
 def _parse_instant(value: str | None) -> datetime | None:
@@ -152,6 +162,7 @@ def plan(
     tz: ZoneInfo,
     ready_label_id: int | None = None,
     critical_label_id: int | None = None,
+    exclude_label_id: int | None = None,
 ) -> Plan:
     """Compute the schedule for one project's tasks. Pure: no network access.
 
@@ -193,7 +204,24 @@ def plan(
     # from any task in it would never stop.
     _check_subtask_cycles(parent, ident, title)
 
+    # Out of scope: open tasks carrying the exclude label, everything beneath them,
+    # and everything waiting on them. None of it can be scheduled without the
+    # excluded work. It keeps its dates, and from here on counts as not open.
+    excluded = _excluded(by_id, is_open, exclude_label_id, blockers, children, ident)
+    is_open = is_open - set(excluded)
+
     duration = {i: _parse_duration(by_id[i].get("description")) for i in is_open}
+
+    # A per-task floor, `Not before: YYYY-MM-DD`. It holds the task and every
+    # subtask beneath it, and successors follow from their blockers' end dates.
+    floors: dict[int, date] = {}
+    for i in is_open:
+        try:
+            floor = _parse_floor(by_id[i].get("description"))
+        except ValueError as err:
+            raise ScheduleError(f"{ident[i]} {title[i]} has a Not before date that is not a date: {err}") from err
+        if floor is not None:
+            floors[i] = floor
 
     def open_kids(p: int) -> set[int]:
         return {c for c in children[p] if c in is_open}
@@ -255,7 +283,8 @@ def plan(
     es: dict[int, date] = {}
     ef: dict[int, date] = {}
     for i in order:
-        first = max([start, *(ef[p] + timedelta(days=1) for p in preds[i])])
+        held = [floors[h] for h in [i, *ancestors(i)] if h in floors]
+        first = max([start, *held, *(ef[p] + timedelta(days=1) for p in preds[i])])
         es[i] = first
         ef[i] = first + timedelta(days=duration[i] - 1)
 
@@ -333,11 +362,47 @@ def plan(
         labels_added=added,
         labels_removed=removed,
         unchanged=len(is_open) - len(changes),
-        done=len(by_id) - len(is_open),
+        excluded=excluded,
+        floors=floors,
+        done=sum(1 for t in by_id.values() if t.get("done")),
         titles=title,
         identifiers=ident,
         dates=new_dates,
     )
+
+
+def _excluded(
+    by_id: dict[int, dict],
+    is_open: set[int],
+    label_id: int | None,
+    blockers: dict[int, set[int]],
+    children: dict[int, set[int]],
+    ident: dict[int, str],
+) -> dict[int, str]:
+    """Open tasks out of scope, each with the reason it is."""
+    if label_id is None:
+        return {}
+    waiting: dict[int, set[int]] = {i: set() for i in by_id}
+    for i, bs in blockers.items():
+        for b in bs:
+            waiting[b].add(i)
+    out: dict[int, str] = {}
+    queue = sorted(
+        i for i in is_open if any(lb.get("id") == label_id for lb in by_id[i].get("labels") or [])
+    )
+    for i in queue:
+        out[i] = "labelled out of scope"
+    while queue:
+        i = queue.pop(0)
+        for c in sorted(children[i]):
+            if c in is_open and c not in out:
+                out[c] = f"subtask of {ident[i]}"
+                queue.append(c)
+        for w in sorted(waiting[i]):
+            if w in is_open and w not in out:
+                out[w] = f"waits on {ident[i]}"
+                queue.append(w)
+    return out
 
 
 def _check_subtask_cycles(parent: dict[int, int], ident: dict, title: dict) -> None:
@@ -413,6 +478,12 @@ def summarise(p: Plan, label_names: dict[int, str], dry_run: bool) -> str:
         "- none"
     ]
 
+    if p.floors:
+        lines.append("")
+        lines.append(f"Held by Not before ({len(p.floors)}):")
+        for i in sorted(p.floors, key=lambda i: (p.floors[i], i)):
+            lines.append(f"- {name(i)}: not before {p.floors[i].isoformat()}, starts {_fmt_day(p.dates[i][0])}")
+
     if p.labels_added or p.labels_removed:
         lines.append("")
         lines.append("Labels:")
@@ -420,6 +491,11 @@ def summarise(p: Plan, label_names: dict[int, str], dry_run: bool) -> str:
             bits = [f"+{label_names.get(lb, lb)}" for lb in p.labels_added.get(i, [])]
             bits += [f"-{label_names.get(lb, lb)}" for lb in p.labels_removed.get(i, [])]
             lines.append(f"- {name(i)}: {', '.join(bits)}")
+
+    if p.excluded:
+        lines.append("")
+        lines.append(f"Not moved, out of scope ({len(p.excluded)}):")
+        lines += [f"- {name(i)}: {why}" for i, why in sorted(p.excluded.items())]
 
     lines.append("")
     lines.append(f"Unchanged: {p.unchanged} open, {p.done} done left as they were.")
@@ -474,6 +550,7 @@ async def reschedule_project(
     timezone: str = "America/New_York",
     ready_label_id: int | None = None,
     critical_label_id: int | None = None,
+    exclude_label_id: int | None = None,
     dry_run: bool = False,
 ) -> str:
     """Re-date every open task in a project from its blocking relations, in one call.
@@ -486,6 +563,10 @@ async def reschedule_project(
     nothing. A parent's blockers hold back its subtasks, and a parent with open
     subtasks spans them. Only relations between tasks in this project count.
 
+    `Not before: YYYY-MM-DD` in a task's description holds that task and its
+    subtasks to that date or later, and its successors follow. The summary lists
+    every task carrying one.
+
     Dates are written as 09:00 on the first day and 17:00 on the last, local time,
     which Vikunja's Gantt chart draws across exactly those days. Only tasks whose
     dates change are written.
@@ -494,6 +575,11 @@ async def reschedule_project(
     comes off every other task in the project. With `ready_label_id`, that label
     goes on every open task with no unfinished blocker or subtask and comes off the
     rest. Resolve both ids with `list_labels` first.
+
+    With `exclude_label_id`, a task carrying that label is out of scope, along
+    with its subtasks and every task waiting on it. None of them move, none count
+    toward the finish date or the critical path, and they lose the ready and
+    critical labels. The summary lists each one and why.
 
     A cycle in the relations is an error naming the tasks on it, and nothing is
     written. `dry_run` computes the same plan and writes nothing.
@@ -508,7 +594,14 @@ async def reschedule_project(
     start = date.fromisoformat(start_date) if start_date else datetime.now(tz).date()
 
     tasks = await _project_tasks(project_id)
-    p = plan(tasks, start, tz, ready_label_id=ready_label_id, critical_label_id=critical_label_id)
+    p = plan(
+        tasks,
+        start,
+        tz,
+        ready_label_id=ready_label_id,
+        critical_label_id=critical_label_id,
+        exclude_label_id=exclude_label_id,
+    )
 
     # Names for the report, taken from tasks that already carry the label. A label
     # on no task yet is reported by id.

@@ -214,9 +214,11 @@ Bucket behaviour:
 <details>
 <summary>Scheduling</summary>
 
-- `reschedule_project(project_id, start_date?, timezone="America/New_York", ready_label_id?, critical_label_id?, dry_run=False)`: re-dates every open task in a project from its blocking relations in one call, and returns a text summary of the finish date, the critical path, and each date and label change.
+- `reschedule_project(project_id, start_date?, timezone="America/New_York", ready_label_id?, critical_label_id?, exclude_label_id?, dry_run=False)`: re-dates every open task in a project from its blocking relations in one call, and returns a text summary of the finish date, the critical path, and each date and label change.
 
 > Durations come from `Estimate: N days` in each description, one day without one. `Estimate: part of ...` puts a subtask on its parent's days. Blocking relations are finish-to-start in calendar days, a parent's blockers hold back its subtasks, and a parent with open subtasks spans them. Done tasks keep their dates. Dates are written as 09:00 on the first day and 17:00 on the last, local time. A relation cycle is reported and nothing is written.
+
+> `Not before: YYYY-MM-DD` in a description holds that task and its subtasks to that date or later, and its successors follow. `exclude_label_id` takes a task out of scope, along with its subtasks and every task waiting on it: they keep their dates and stay out of the finish date and the critical path. The summary lists both.
 
 > `critical_label_id` goes on every zero-slack task and comes off the rest. `ready_label_id` goes on every open task with no unfinished blocker or subtask and comes off the rest. `dry_run=True` reports the plan without writing.
 

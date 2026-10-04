@@ -173,8 +173,12 @@ to a loop of `update_task()` calls whenever dates follow from blocking relations
 It reads `Estimate: N days` from each description, chains blockers finish-to-start
 in calendar days, and spans each parent across its open subtasks. Run it with
 `dry_run=True` first and show the plan before writing. Resolve
-`critical_label_id` and `ready_label_id` with `list_labels()`. Each label comes
-off every task in the project that no longer qualifies.
+`critical_label_id`, `ready_label_id`, and `exclude_label_id` with
+`list_labels()`. The first two come off every task in the project that no longer
+qualifies. Hold a task to a date with `Not before: YYYY-MM-DD` in its
+description. Take work out of the current scope with the exclude label, never
+with a far-off date: excluded work keeps its dates and stays out of the finish
+date and the critical path.
 
 ## Calls that cannot be undone
 

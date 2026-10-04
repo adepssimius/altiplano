@@ -373,6 +373,112 @@ def test_labels_are_left_alone_when_no_label_id_is_given():
     assert p.labels_added == p.labels_removed == {}
 
 
+# --- Not before ----------------------------------------------------------------------
+def test_not_before_holds_a_task_and_its_successors():
+    tasks = [task(1, desc="Estimate: 2 days<p>Not before: 2026-10-20</p>"), task(2, days=1)]
+    link(tasks, "blocking", 1, 2)
+    p = plan(tasks, START, NY)
+    assert days(p, 1) == (d("2026-10-20"), d("2026-10-21"))
+    assert days(p, 2) == (d("2026-10-22"), d("2026-10-22"))
+    assert p.floors == {1: d("2026-10-20")}
+
+
+def test_not_before_on_a_parent_holds_its_subtasks():
+    tasks = [task(10, desc="not before: 2026-11-02"), task(11, days=1), task(12, days=2)]
+    link(tasks, "subtask", 10, 11)
+    link(tasks, "subtask", 10, 12)
+    p = plan(tasks, START, NY)
+    assert days(p, 11) == (d("2026-11-02"), d("2026-11-02"))
+    assert days(p, 10) == (d("2026-11-02"), d("2026-11-03"))
+
+
+def test_a_not_before_earlier_than_the_start_date_changes_nothing():
+    p = plan([task(1, desc="Estimate: 1 day. Not before: 2026-01-01")], START, NY)
+    assert days(p, 1) == (START, START)
+
+
+def test_a_blocker_later_than_the_floor_still_wins():
+    tasks = [task(1, days=10), task(2, desc="Not before: 2026-10-07")]
+    link(tasks, "blocking", 1, 2)
+    p = plan(tasks, START, NY)
+    assert days(p, 2) == (d("2026-10-15"), d("2026-10-15"))
+
+
+def test_a_not_before_that_is_not_a_date_is_refused():
+    with pytest.raises(ScheduleError, match="#1 Task 1 has a Not before date that is not a date"):
+        plan([task(1, desc="Not before: 2026-13-45")], START, NY)
+
+
+def test_a_done_task_with_a_not_before_is_ignored():
+    p = plan([task(1, done=True, desc="Not before: 2026-13-45")], START, NY)
+    assert p.floors == {}
+
+
+# --- scope ------------------------------------------------------------------------------
+def test_an_excluded_task_its_subtasks_and_its_successors_do_not_move():
+    april = "2027-04-01T13:00:00Z"
+    tasks = [
+        task(7, labels=[66], start=april, end=april),
+        task(8, days=1),
+        task(9, days=1),
+        task(20, days=1),
+        task(21, days=1),
+        task(30, days=3),
+    ]
+    link(tasks, "subtask", 7, 8)
+    link(tasks, "blocking", 9, 8)
+    link(tasks, "blocking", 8, 20)
+    link(tasks, "blocking", 20, 21)
+    p = plan(tasks, START, NY, exclude_label_id=66)
+    assert p.excluded == {7: "labelled out of scope", 8: "subtask of #7", 20: "waits on #8", 21: "waits on #20"}
+    assert set(p.dates) == {9, 30}
+    assert {c.task_id for c in p.changes} == {9, 30}
+    # The finish and the critical path are those of the work in scope.
+    assert p.finish == d("2026-10-07")
+    assert p.critical_path == [30]
+    assert p.done == 0
+
+
+def test_exclusion_names_each_task_once_and_skips_done_ones():
+    # 20 is reached twice, through 7 and through its subtask 8. 9 is done.
+    tasks = [task(7, labels=[66]), task(8, days=1), task(9, days=1, done=True), task(20, days=1)]
+    link(tasks, "subtask", 7, 8)
+    link(tasks, "subtask", 7, 9)
+    link(tasks, "blocking", 7, 20)
+    link(tasks, "blocking", 8, 20)
+    p = plan(tasks, START, NY, exclude_label_id=66)
+    assert p.excluded == {7: "labelled out of scope", 8: "subtask of #7", 20: "waits on #7"}
+
+
+def test_excluded_tasks_lose_the_ready_and_critical_labels():
+    tasks = [task(7, days=1, labels=[66, 5, 9]), task(8, days=1)]
+    p = plan(tasks, START, NY, ready_label_id=5, critical_label_id=9, exclude_label_id=66)
+    assert p.labels_removed == {7: [5, 9]}
+    assert p.labels_added == {8: [5, 9]}
+
+
+def test_a_parent_with_every_subtask_excluded_is_scheduled_on_its_own_estimate():
+    tasks = [task(10, days=2), task(11, days=5, labels=[66])]
+    link(tasks, "subtask", 10, 11)
+    p = plan(tasks, START, NY, exclude_label_id=66)
+    assert days(p, 10) == (d("2026-10-05"), d("2026-10-06"))
+    assert p.excluded == {11: "labelled out of scope"}
+
+
+def test_the_exclude_label_does_nothing_on_done_tasks_or_when_not_given():
+    tasks = [task(1, days=1, done=True, labels=[66]), task(2, days=1, labels=[66])]
+    assert plan(tasks, START, NY).excluded == {}
+    assert plan(tasks, START, NY, exclude_label_id=66).excluded == {2: "labelled out of scope"}
+
+
+def test_summary_lists_floors_and_out_of_scope_tasks():
+    tasks = [task(1, title="Dig", desc="Not before: 2026-10-09"), task(2, title="AC", days=1, labels=[66])]
+    text = summarise(plan(tasks, START, NY, exclude_label_id=66), {}, dry_run=True)
+    assert "Held by Not before (1):\n- #1 Dig: not before 2026-10-09, starts 2026-10-09" in text
+    assert "Not moved, out of scope (1):\n- #2 AC: labelled out of scope" in text
+    assert "Unchanged: 0 open, 0 done left as they were." in text
+
+
 # --- the report -----------------------------------------------------------------------
 def test_summary_is_compact_and_carries_no_descriptions():
     tasks = [task(1, title="Dig", days=2, desc="Estimate: 2 days SECRET"), task(2, title="Fill", days=1, labels=[7])]
