@@ -26,6 +26,7 @@ from altiplano.tools import (
     labels,
     projects,
     relations,
+    schedule,
     tasks,
 )
 
@@ -41,6 +42,7 @@ __all__ = [
     "projects",
     "prompts",
     "relations",
+    "schedule",
     "tasks",
 ]
 

@@ -64,6 +64,7 @@ EXPECTED_TOOLS = {
     "list_assignees",
     "add_assignee",
     "remove_assignee",
+    "reschedule_project",
 }
 
 

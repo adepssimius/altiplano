@@ -18,6 +18,7 @@ from altiplano.tools import (
     labels,
     projects,
     relations,
+    schedule,
     tasks,
 )
 
@@ -271,6 +272,14 @@ ROUTES = [
         response=READ_BACK,
     ),
     route("search_users", lambda: assignees.search_users("stefan"), READ, "/users", {}),
+    # An empty project: the one listing, then nothing to write.
+    route(
+        "reschedule_project",
+        lambda: schedule.reschedule_project(3, start_date="2026-10-05"),
+        READ,
+        "/projects/3/tasks",
+        {},
+    ),
 ]
 
 

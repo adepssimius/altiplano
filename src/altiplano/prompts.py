@@ -166,6 +166,16 @@ the other task a child of the base. `remove_relation()` needs the same
 `relation_kind` the relation was created with, and `get_task()` reports the kinds
 a task currently has.
 
+## Scheduling
+
+`reschedule_project()` re-dates every open task in a project in one call. Prefer it
+to a loop of `update_task()` calls whenever dates follow from blocking relations.
+It reads `Estimate: N days` from each description, chains blockers finish-to-start
+in calendar days, and spans each parent across its open subtasks. Run it with
+`dry_run=True` first and show the plan before writing. Resolve
+`critical_label_id` and `ready_label_id` with `list_labels()`. Each label comes
+off every task in the project that no longer qualifies.
+
 ## Calls that cannot be undone
 
 `delete_task()` takes the task's comments, labels, and assignees with it. Vikunja

@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented here.
 
+## [2.1.0]
+
+### Added
+
+- `reschedule_project(project_id, start_date?, timezone?, ready_label_id?,
+  critical_label_id?, dry_run?)`. It re-dates every open task in a project from
+  its blocking relations in one call: one paginated read, a forward pass and a
+  backward pass in memory, then a write for each task whose dates changed.
+  Durations come from `Estimate: N days` in the description. A parent spans its
+  open subtasks, and an `Estimate: part of ...` subtask shares its parent's days.
+  Dates are written as 09:00 on the first day and 17:00 on the last, in the given
+  time zone with each day's own UTC offset. Vikunja's Gantt chart draws the end
+  date's day inclusively, and those times fill exactly the days of work.
+
+  The optional labels mark the critical path and the tasks ready to start, and
+  come off every task that no longer qualifies. A relation cycle is reported with
+  the tasks on it, and nothing is written. The tool returns a compact summary,
+  never a task's description or its related tasks.
+
 ## [2.0.1]
 
 ### Fixed
