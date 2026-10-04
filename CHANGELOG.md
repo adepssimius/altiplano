@@ -22,7 +22,16 @@ All notable changes to this project are documented here.
   finish date and the critical path, and the summary lists it with the reason.
 
   The optional labels mark the critical path and the tasks ready to start, and
-  come off every task that no longer qualifies. A relation cycle is reported with
+  come off every task that no longer qualifies.
+
+- `complete_task(task_id, completed_date?, actual_start_date?, reschedule?, ...)`
+  and `reopen_task(task_id, reschedule?, ...)`. Completing a task records the
+  dates the work actually took, then recomputes the project through the same
+  function `reschedule_project` uses: dates from today when `reschedule` is on,
+  and the ready and critical labels always. The summary reports what became
+  ready, what moved on or off the critical path, and how far the finish moved
+  against the dates stored before. A parent left with no open subtask is named
+  and stays open. `reopen_task` undoes a completion the same way. A relation cycle is reported with
   the tasks on it, and nothing is written. The tool returns a compact summary,
   never a task's description or its related tasks.
 

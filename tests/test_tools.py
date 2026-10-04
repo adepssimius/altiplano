@@ -280,6 +280,23 @@ ROUTES = [
         "/projects/3/tasks",
         {},
     ),
+    # A task in the state asked for: the one read, and nothing to write.
+    route(
+        "complete_task",
+        lambda: schedule.complete_task(7),
+        READ,
+        "/tasks/7",
+        {},
+        response={"id": 7, "identifier": "#7", "title": "Existing", "project_id": 3, "done": True},
+    ),
+    route(
+        "reopen_task",
+        lambda: schedule.reopen_task(7),
+        READ,
+        "/tasks/7",
+        {},
+        response={"id": 7, "identifier": "#7", "title": "Existing", "project_id": 3, "done": False},
+    ),
 ]
 
 

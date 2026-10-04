@@ -640,3 +640,312 @@ def test_start_date_defaults_to_today_in_the_timezone(api, run, monkeypatch):
     api.returns([task(1, days=1)])
     text = run(schedule.reschedule_project(3, dry_run=True))
     assert "Project finish: 2026-10-05" in text
+
+
+# --- complete_task and reopen_task ------------------------------------------------------
+def freeze(monkeypatch, day):
+    """Make today `day` in New York, for the tools that default to today."""
+    noon = datetime.fromisoformat(f"{day}T12:00:00-04:00")
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return noon.astimezone(tz)
+
+    monkeypatch.setattr(schedule, "datetime", Frozen)
+
+
+def at(day, hour):
+    """A stored date: `hour` o'clock in New York on `day`, as Vikunja returns it in UTC."""
+    local = datetime.fromisoformat(f"{day}T{hour:02d}:00:00-04:00")
+    return local.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+
+
+def on(day, last=None):
+    """Stored dates for a task planned across `day` to `last`."""
+    return {"start": at(day, 9), "end": at(last or day, 17)}
+
+
+def served(api, tasks, task_id, *writes):
+    """Answer the task read, the project listing, then any writes."""
+    target = next(t for t in tasks if t["id"] == task_id)
+    api.returns_in_order(
+        httpx.Response(200, json={**target, "project_id": 3}),
+        httpx.Response(200, json={"items": tasks, "total_pages": 1}),
+        *(writes or [httpx.Response(200, json={"ok": True})]),
+    )
+
+
+def calls(api):
+    return [(r.method, r.url.path.removeprefix("/api/v2")) for r in api.requests]
+
+
+V2 = pytest.mark.parametrize("api_version", [2])
+
+
+@V2
+def test_completing_a_task_makes_its_successor_ready(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-05")
+    tasks = [task(1, title="Dig", days=1, **on("2026-10-05")), task(2, title="Fill", days=1, **on("2026-10-06"))]
+    link(tasks, "blocking", 1, 2)
+    served(api, tasks, 1)
+    text = run(schedule.complete_task(1, dry_run=True))
+    assert text.splitlines()[:2] == ["Dry run. Nothing was written.", "#1 Dig — done, 2026-10-05 → 2026-10-05"]
+    assert "Became ready (1):\n- #2 Fill" in text
+    assert "- #2 Fill: 2026-10-06 → 2026-10-05" in text
+    assert "Project finish: 2026-10-05, 1 day earlier than 2026-10-06." in text
+    assert calls(api) == [("GET", "/tasks/1"), ("GET", "/projects/3/tasks")]
+
+
+@V2
+def test_a_successor_with_another_open_blocker_does_not_become_ready(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-05")
+    tasks = [task(1, days=1), task(3, days=2), task(2, days=1)]
+    link(tasks, "blocking", 1, 2)
+    link(tasks, "blocking", 3, 2)
+    served(api, tasks, 1)
+    text = run(schedule.complete_task(1, dry_run=True))
+    assert "Became ready" not in text
+
+
+@V2
+def test_finishing_early_moves_the_finish_earlier(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-05")
+    tasks = [task(1, days=3, **on("2026-10-05", "2026-10-07")), task(2, days=1, **on("2026-10-08"))]
+    link(tasks, "blocking", 1, 2)
+    served(api, tasks, 1)
+    text = run(schedule.complete_task(1, dry_run=True))
+    assert "Project finish: 2026-10-05, 3 days earlier than 2026-10-08." in text
+
+
+@V2
+def test_finishing_late_moves_the_finish_later(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-08")
+    tasks = [task(1, days=1, **on("2026-10-05")), task(2, days=1, **on("2026-10-06"))]
+    link(tasks, "blocking", 1, 2)
+    served(api, tasks, 1)
+    text = run(schedule.complete_task(1, dry_run=True))
+    assert "#1 Task 1 — done, 2026-10-05 → 2026-10-08" in text
+    assert "Project finish: 2026-10-08, 2 days later than 2026-10-06." in text
+
+
+@V2
+def test_completing_the_last_subtask_leaves_the_parent_open_and_ready(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-05")
+    tasks = [task(10, title="Parent"), task(11, days=1, done=True), task(12, days=1)]
+    link(tasks, "subtask", 10, 11)
+    link(tasks, "subtask", 10, 12)
+    served(api, tasks, 12)
+    text = run(schedule.complete_task(12, ready_label_id=5))
+    assert "Became ready (1):\n- #10 Parent" in text
+    assert "Every subtask now done, parent left open for you to close:\n- #10 Parent" in text
+    # The parent is re-dated as an ordinary task now, and labelled ready. It is never
+    # marked done.
+    parent_writes = [json.loads(r.content) for r in api.requests if r.url.path.endswith("/tasks/10")]
+    assert parent_writes and all("done" not in w for w in parent_writes)
+    assert ("POST", "/tasks/10/labels") in calls(api)
+
+
+@V2
+def test_a_parent_with_another_open_subtask_is_not_mentioned(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-05")
+    tasks = [task(10), task(11, days=1), task(12, days=1), task(20, done=True)]
+    link(tasks, "subtask", 10, 11)
+    link(tasks, "subtask", 10, 12)
+    link(tasks, "subtask", 20, 12)
+    served(api, tasks, 12)
+    with pytest.raises(ScheduleError, match="two parents"):
+        run(schedule.complete_task(12, dry_run=True))
+    tasks = [task(10), task(11, days=1), task(12, days=1)]
+    link(tasks, "subtask", 10, 11)
+    link(tasks, "subtask", 10, 12)
+    served(api, tasks, 12)
+    assert "parent left open" not in run(schedule.complete_task(12, dry_run=True))
+
+
+@V2
+def test_a_done_parent_is_not_mentioned(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-05")
+    tasks = [task(10, done=True), task(12, days=1)]
+    link(tasks, "subtask", 10, 12)
+    served(api, tasks, 12)
+    assert "parent left open" not in run(schedule.complete_task(12, dry_run=True))
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@V2
+def test_completing_a_task_that_is_already_done_changes_nothing(api, run, api_version, dry_run):
+    tasks = [task(1, title="Dig", done=True)]
+    served(api, tasks, 1)
+    text = run(schedule.complete_task(1, dry_run=dry_run))
+    assert text.endswith("#1 Dig is already done. Nothing was changed.")
+    assert text.startswith("Dry run.") == dry_run
+    assert calls(api) == [("GET", "/tasks/1")]
+
+
+@V2
+def test_complete_writes_the_task_first_then_dates_then_labels(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-05")
+    tasks = [task(1, days=1, labels=[5, 9], **on("2026-10-03")), task(2, days=1, **on("2026-10-09"))]
+    link(tasks, "blocking", 1, 2)
+    served(api, tasks, 1)
+    run(schedule.complete_task(1, ready_label_id=5, critical_label_id=9))
+    assert calls(api) == [
+        ("GET", "/tasks/1"),
+        ("GET", "/projects/3/tasks"),
+        ("PATCH", "/tasks/1"),
+        ("PATCH", "/tasks/2"),
+        ("POST", "/tasks/2/labels"),
+        ("POST", "/tasks/2/labels"),
+        ("DELETE", "/tasks/1/labels/5"),
+        ("DELETE", "/tasks/1/labels/9"),
+    ]
+    # The stored start is kept, normalised to 09:00.
+    assert json.loads(api.requests[2].content) == {
+        "done": True,
+        "start_date": "2026-10-03T09:00:00-04:00",
+        "end_date": "2026-10-05T17:00:00-04:00",
+    }
+
+
+@V2
+def test_complete_takes_an_explicit_start_and_completion_date(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-05")
+    served(api, [task(1, days=1)], 1)
+    run(schedule.complete_task(1, completed_date="2026-11-02", actual_start_date="2026-10-30"))
+    assert json.loads(api.requests[2].content) == {
+        "done": True,
+        "start_date": "2026-10-30T09:00:00-04:00",
+        "end_date": "2026-11-02T17:00:00-05:00",
+    }
+
+
+@pytest.mark.parametrize("stored", [{}, on("2026-10-09")])
+@V2
+def test_complete_starts_on_the_completion_date_without_an_earlier_start(api, run, monkeypatch, api_version, stored):
+    freeze(monkeypatch, "2026-10-05")
+    served(api, [task(1, days=1, **stored)], 1)
+    run(schedule.complete_task(1))
+    assert json.loads(api.requests[2].content)["start_date"] == "2026-10-05T09:00:00-04:00"
+
+
+@V2
+def test_complete_refuses_a_start_after_the_completion(api, run, api_version):
+    served(api, [task(1, days=1)], 1)
+    with pytest.raises(ValueError, match="is after completed_date"):
+        run(schedule.complete_task(1, completed_date="2026-10-05", actual_start_date="2026-10-06"))
+    assert calls(api) == [("GET", "/tasks/1")]
+
+
+@V2
+def test_complete_without_reschedule_keeps_dates_but_moves_labels(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-05")
+    tasks = [task(1, days=1, **on("2026-10-05")), task(2, days=1, **on("2026-10-09"))]
+    link(tasks, "blocking", 1, 2)
+    served(api, tasks, 1)
+    text = run(schedule.complete_task(1, reschedule=False, ready_label_id=5))
+    assert ("PATCH", "/tasks/2") not in calls(api)
+    assert ("POST", "/tasks/2/labels") in calls(api)
+    assert "Date changes (0):\n- none" in text
+    assert "Project finish: 2026-10-09, unchanged." in text
+
+
+@V2
+def test_complete_reports_the_critical_path_moving(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-05")
+    # Before: 1 (3 days) then 3 is critical, 2 has slack. After 1 is done, 2 then 3 is.
+    tasks = [task(1, days=3, labels=[9]), task(2, days=1), task(3, days=1, labels=[9])]
+    link(tasks, "blocking", 1, 3)
+    link(tasks, "blocking", 2, 3)
+    served(api, tasks, 1)
+    text = run(schedule.complete_task(1, critical_label_id=9, dry_run=True))
+    assert "Joined the critical path (1):\n- #2 Task 2" in text
+    assert "Left the critical path" not in text
+
+
+@V2
+def test_complete_without_label_ids_compares_computed_sets(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-05")
+    tasks = [task(1, days=1), task(2, days=1), task(3, days=1)]
+    link(tasks, "blocking", 1, 3)
+    link(tasks, "blocking", 2, 3)
+    served(api, tasks, 2)
+    text = run(schedule.complete_task(2, dry_run=True))
+    assert "Became ready" not in text
+    assert "Left the critical path" not in text
+
+
+@V2
+def test_complete_keeps_out_of_scope_work_out(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-05")
+    tasks = [task(1, days=1), task(7, title="AC", days=1, labels=[66], **on("2027-04-01"))]
+    served(api, tasks, 1)
+    text = run(schedule.complete_task(1, exclude_label_id=66, dry_run=True))
+    assert "Not moved, out of scope (1):\n- #7 AC: labelled out of scope" in text
+    assert "Project finish: no open tasks remain in scope." in text
+
+
+@V2
+def test_complete_reports_a_cycle_it_breaks_without_a_before_plan(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-05")
+    tasks = [task(1, days=1), task(2, days=1)]
+    link(tasks, "blocking", 1, 2)
+    link(tasks, "blocking", 2, 1)
+    served(api, tasks, 1)
+    text = run(schedule.complete_task(1, dry_run=True))
+    assert "Project finish: 2026-10-05, unchanged." in text
+
+
+@V2
+def test_a_failed_completion_points_at_reschedule_project(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-05")
+    tasks = [task(1, days=1), task(2, days=1)]
+    link(tasks, "blocking", 1, 2)
+    served(api, tasks, 1, httpx.Response(200, json={"id": 1}), httpx.Response(500, json={"message": "boom"}))
+    with pytest.raises(RuntimeError) as err:
+        run(schedule.complete_task(1))
+    assert "Already written: done on #1." in str(err.value)
+    assert "Run reschedule_project to finish the rest." in str(err.value)
+
+
+def test_complete_refuses_an_unreadable_task(api, run):
+    api.returns_raw(204)
+    with pytest.raises(RuntimeError, match="did not return task 1"):
+        run(schedule.complete_task(1))
+
+
+@V2
+def test_reopen_restores_the_labels(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-05")
+    tasks = [task(1, title="Dig", days=1, done=True, **on("2026-10-02")), task(2, title="Fill", days=1, labels=[5])]
+    link(tasks, "blocking", 1, 2)
+    served(api, tasks, 1)
+    text = run(schedule.reopen_task(1, ready_label_id=5))
+    assert calls(api)[2:] == [
+        ("PATCH", "/tasks/1"),
+        ("PATCH", "/tasks/1"),
+        ("PATCH", "/tasks/2"),
+        ("POST", "/tasks/1/labels"),
+        ("DELETE", "/tasks/2/labels/5"),
+    ]
+    assert json.loads(api.requests[2].content) == {"done": False}
+    assert text.splitlines()[1] == "#1 Dig — reopened, 2026-10-05"
+    assert "Lost ready (1):\n- #2 Fill" in text
+    assert "parent left open" not in text
+
+
+@V2
+def test_reopen_without_reschedule_leaves_dates(api, run, monkeypatch, api_version):
+    freeze(monkeypatch, "2026-10-05")
+    served(api, [task(1, days=1, done=True, **on("2026-10-02"))], 1)
+    text = run(schedule.reopen_task(1, reschedule=False, dry_run=True))
+    assert text.splitlines()[1] == "#1 Task 1 — reopened, dates unchanged"
+    assert calls(api) == [("GET", "/tasks/1"), ("GET", "/projects/3/tasks")]
+
+
+@V2
+def test_reopening_an_open_task_changes_nothing(api, run, api_version):
+    served(api, [task(1, title="Dig", days=1)], 1)
+    text = run(schedule.reopen_task(1))
+    assert text == "#1 Dig is already open. Nothing was changed."
+    assert calls(api) == [("GET", "/tasks/1")]

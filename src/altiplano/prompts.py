@@ -180,6 +180,12 @@ description. Take work out of the current scope with the exclude label, never
 with a far-off date: excluded work keeps its dates and stays out of the finish
 date and the critical path.
 
+`complete_task()` closes a task with the dates the work actually took and runs
+the same recompute, from today. `reopen_task()` undoes it. Pass both the same
+label ids as `reschedule_project()`, the exclude label included, or out-of-scope
+work comes back into the plan. Neither closes a parent: the summary names a
+parent whose subtasks are all done, and closing it is the user's call.
+
 ## Calls that cannot be undone
 
 `delete_task()` takes the task's comments, labels, and assignees with it. Vikunja

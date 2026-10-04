@@ -65,6 +65,8 @@ EXPECTED_TOOLS = {
     "add_assignee",
     "remove_assignee",
     "reschedule_project",
+    "complete_task",
+    "reopen_task",
 }
 
 

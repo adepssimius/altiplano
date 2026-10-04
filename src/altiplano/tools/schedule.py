@@ -24,10 +24,12 @@ local time. Vikunja's Gantt chart draws the end date's day inclusively, and a ta
 ending at midnight would draw one day short.
 """
 
+import copy
 import html
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from altiplano.api import _NO_DATE, _items, _request, _verb
@@ -65,7 +67,7 @@ class Change:
 
 @dataclass
 class Plan:
-    """Everything `reschedule_project` would write, and what it reports."""
+    """Everything a recompute would write, and what it reports."""
 
     finish: date | None
     critical_path: list[int]
@@ -79,6 +81,8 @@ class Plan:
     titles: dict[int, str] = field(default_factory=dict)
     identifiers: dict[int, str] = field(default_factory=dict)
     dates: dict[int, tuple[date, date]] = field(default_factory=dict)
+    ready: set[int] = field(default_factory=set)
+    critical: set[int] = field(default_factory=set)
 
 
 def _plain(description: str | None) -> str:
@@ -363,6 +367,8 @@ def plan(
         labels_removed=removed,
         unchanged=len(is_open) - len(changes),
         excluded=excluded,
+        ready=ready,
+        critical=critical,
         floors=floors,
         done=sum(1 for t in by_id.values() if t.get("done")),
         titles=title,
@@ -520,10 +526,117 @@ async def _project_tasks(project_id: int) -> list[dict]:
         page += 1
 
 
-async def _apply(p: Plan) -> None:
-    """Write the plan: dates first, then labels. A failure says what already landed."""
+@dataclass
+class TaskEdit:
+    """A change to one task's own state, written before anything the plan writes."""
+
+    task_id: int
+    payload: dict[str, Any]
+    what: str
+
+
+@dataclass
+class Recompute:
+    """The project before and after an edit, as `_recompute_project` computed it.
+
+    `before` is None when the project could not be planned before the edit: a
+    blocking cycle that the edit itself breaks, for instance.
+    """
+
+    before: Plan | None
+    after: Plan
+    tasks: list[dict]
+    label_names: dict[int, str]
+
+
+def _zone(timezone: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError) as err:
+        raise ValueError(f"unknown timezone {timezone!r}") from err
+
+
+def _today(tz: ZoneInfo) -> date:
+    return datetime.now(tz).date()
+
+
+def _with_state(
+    tasks: list[dict], task_id: int, done: bool, start: str | None = None, end: str | None = None
+) -> list[dict]:
+    """A copy of the listing with one task's state changed, as if it were written.
+
+    The done flag is also changed on every embedded copy of the task in other tasks'
+    `related_tasks`. Readiness reads those copies.
+    """
+    out = copy.deepcopy(tasks)
+    for t in out:
+        if t["id"] == task_id:
+            t["done"] = done
+            if start is not None:
+                t["start_date"] = start
+            if end is not None:
+                t["end_date"] = end
+        for entries in (t.get("related_tasks") or {}).values():
+            for r in entries or []:
+                if r.get("id") == task_id:
+                    r["done"] = done
+    return out
+
+
+async def _recompute_project(
+    project_id: int,
+    start: date,
+    tz: ZoneInfo,
+    *,
+    ready_label_id: int | None = None,
+    critical_label_id: int | None = None,
+    exclude_label_id: int | None = None,
+    reschedule: bool = True,
+    dry_run: bool = False,
+    tasks: list[dict] | None = None,
+    edit: TaskEdit | None = None,
+    edited: list[dict] | None = None,
+    resume_hint: str = "Run it again to finish: it computes from current state.",
+) -> Recompute:
+    """The one place dates, the critical path, and the labels are worked out and written.
+
+    Plans the project as read (`before`) and as it stands after `edit` (`after`),
+    then writes `edit`, the date changes, and the label changes, in that order.
+    Without `reschedule` the dates stay as they are and only the labels follow the
+    new plan. Every tool that changes a schedule goes through here.
+    """
+    if tasks is None:
+        tasks = await _project_tasks(project_id)
+    kwargs = {
+        "ready_label_id": ready_label_id,
+        "critical_label_id": critical_label_id,
+        "exclude_label_id": exclude_label_id,
+    }
+    after = plan(edited if edited is not None else tasks, start, tz, **kwargs)
+    try:
+        before = plan(tasks, start, tz, **kwargs) if edited is not None else after
+    except ScheduleError:
+        before = None
+    if not reschedule:
+        after.unchanged += len(after.changes)
+        after.changes = []
+
+    # Names for the report, taken from tasks that already carry the label. A label
+    # on no task yet is reported by id.
+    label_names = {lb["id"]: lb.get("title") or str(lb["id"]) for t in tasks for lb in t.get("labels") or []}
+
+    if not dry_run:
+        await _apply(after, edit, resume_hint)
+    return Recompute(before=before, after=after, tasks=tasks, label_names=label_names)
+
+
+async def _apply(p: Plan, edit: TaskEdit | None, resume_hint: str) -> None:
+    """Write the edit, then dates, then labels. A failure says what already landed."""
     done: list[str] = []
     try:
+        if edit is not None:
+            await _write_task(edit.task_id, edit.payload)
+            done.append(edit.what)
         for c in p.changes:
             await _write_task(c.task_id, {"start_date": c.start, "end_date": c.end})
             done.append(f"dates on {p.identifiers[c.task_id]}")
@@ -538,8 +651,7 @@ async def _apply(p: Plan) -> None:
     except Exception as err:
         written = ", ".join(done) if done else "nothing"
         raise RuntimeError(
-            f"reschedule_project stopped partway. Already written: {written}. "
-            f"Re-run it to finish: it computes from current state. Cause: {err}"
+            f"Stopped partway. Already written: {written}. {resume_hint} Cause: {err}"
         ) from err
 
 
@@ -587,27 +699,238 @@ async def reschedule_project(
     Returns a text summary: the finish date, the critical path, each date change,
     each label change, and a count of tasks left alone.
     """
-    try:
-        tz = ZoneInfo(timezone)
-    except (ZoneInfoNotFoundError, ValueError) as err:
-        raise ValueError(f"unknown timezone {timezone!r}") from err
-    start = date.fromisoformat(start_date) if start_date else datetime.now(tz).date()
-
-    tasks = await _project_tasks(project_id)
-    p = plan(
-        tasks,
+    tz = _zone(timezone)
+    start = date.fromisoformat(start_date) if start_date else _today(tz)
+    r = await _recompute_project(
+        project_id,
         start,
         tz,
         ready_label_id=ready_label_id,
         critical_label_id=critical_label_id,
         exclude_label_id=exclude_label_id,
+        dry_run=dry_run,
     )
+    return summarise(r.after, r.label_names, dry_run)
 
-    # Names for the report, taken from tasks that already carry the label. A label
-    # on no task yet is reported by id.
-    label_names = {lb["id"]: lb.get("title") or str(lb["id"]) for t in tasks for lb in t.get("labels") or []}
 
-    if not dry_run:
-        await _apply(p)
-    return summarise(p, label_names, dry_run)
+async def _read_task(task_id: int) -> dict:
+    t = await _request("GET", f"/tasks/{task_id}")
+    if not isinstance(t, dict) or "id" not in t:
+        raise RuntimeError(f"the API did not return task {task_id}. Nothing was changed.")
+    return t
 
+
+def _members(r: Recompute, label_id: int | None, attr: str) -> tuple[set[int], set[int]]:
+    """Who held a status before the edit and who holds it after.
+
+    Before is the label as it sits on the tasks when there is a label to read, and
+    the computed set otherwise. After is always computed.
+    """
+    if label_id is not None:
+        then = {t["id"] for t in r.tasks if any(lb.get("id") == label_id for lb in t.get("labels") or [])}
+    else:
+        then = getattr(r.before, attr) if r.before else set()
+    return then, getattr(r.after, attr)
+
+
+def _stored_finish(tasks: list[dict], ids: set[int], tz: ZoneInfo) -> date | None:
+    """The latest end date already in Vikunja among these tasks."""
+    ends = [_local_day(t.get("end_date"), tz) for t in tasks if t["id"] in ids]
+    return max((e for e in ends if e), default=None)
+
+
+def _status_report(
+    r: Recompute,
+    tz: ZoneInfo,
+    task_id: int,
+    headline: str,
+    completed: bool,
+    reschedule: bool,
+    ready_label_id: int | None,
+    critical_label_id: int | None,
+    dry_run: bool,
+) -> str:
+    """The summary `complete_task` and `reopen_task` return."""
+    p = r.after
+
+    def name(i: int) -> str:
+        return f"{p.identifiers[i]} {p.titles[i]}"
+
+    lines = ["Dry run. Nothing was written." if dry_run else "Done.", headline]
+
+    for label, (then, now) in (
+        ("ready", _members(r, ready_label_id, "ready")),
+        ("critical path", _members(r, critical_label_id, "critical")),
+    ):
+        joined = sorted(now - then - {task_id})
+        left = sorted(then - now - {task_id})
+        verb_in, verb_out = ("Became ready", "Lost ready") if label == "ready" else (
+            "Joined the critical path",
+            "Left the critical path",
+        )
+        for title_, ids in ((verb_in, joined), (verb_out, left)):
+            if ids:
+                lines.append("")
+                lines.append(f"{title_} ({len(ids)}):")
+                lines += [f"- {name(i)}" for i in ids]
+
+    others = [c for c in p.changes if c.task_id != task_id]
+    lines.append("")
+    lines.append(f"Date changes ({len(others)}):")
+    lines += [f"- {name(c.task_id)}: {_fmt_span(c.old)} → {_fmt_span(c.new)}" for c in others] or ["- none"]
+
+    previous_ids = set(r.before.dates) if r.before else set()
+    previous = _stored_finish(r.tasks, previous_ids, tz)
+    new = p.finish if reschedule else _stored_finish(r.tasks, set(p.dates), tz)
+    lines.append("")
+    if new is None:
+        lines.append("Project finish: no open tasks remain in scope.")
+    elif previous is None or previous == new:
+        lines.append(f"Project finish: {new.isoformat()}, unchanged.")
+    else:
+        moved = (new - previous).days
+        way = "later" if moved > 0 else "earlier"
+        unit = "day" if abs(moved) == 1 else "days"
+        lines.append(f"Project finish: {new.isoformat()}, {abs(moved)} {unit} {way} than {previous.isoformat()}.")
+
+    # Only a completion can leave a parent with nothing open beneath it.
+    by_id = {t["id"]: t for t in r.tasks}
+    finished = []
+    for j in _related_ids(by_id[task_id], "parenttask") if completed else []:
+        if j not in by_id or by_id[j].get("done"):
+            continue
+        kids = [k for k in _related_ids(by_id[j], "subtask") if k in by_id]
+        if all(k == task_id or by_id[k].get("done") for k in kids):
+            finished.append(j)
+    if finished:
+        lines.append("")
+        lines.append("Every subtask now done, parent left open for you to close:")
+        lines += [f"- {name(j)}" for j in finished]
+
+    if p.excluded:
+        lines.append("")
+        lines.append(f"Not moved, out of scope ({len(p.excluded)}):")
+        lines += [f"- {name(i)}: {why}" for i, why in sorted(p.excluded.items())]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def complete_task(
+    task_id: int,
+    completed_date: str | None = None,
+    actual_start_date: str | None = None,
+    reschedule: bool = True,
+    timezone: str = "America/New_York",
+    ready_label_id: int | None = None,
+    critical_label_id: int | None = None,
+    exclude_label_id: int | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Mark a task done, record when the work happened, and bring its project up to date.
+
+    The task's dates become the work actually done: `actual_start_date` at 09:00
+    to `completed_date` at 17:00, local time, both ISO dates. `completed_date`
+    defaults to today. Without `actual_start_date` the task keeps the start date
+    it has, or starts on `completed_date` when it has none or it falls later.
+
+    The rest of the project is then recomputed the way `reschedule_project` does
+    it, from today. With `reschedule` the open tasks are re-dated, and without it
+    their dates stay. The ready and critical labels are recomputed across the
+    project either way, and come off the completed task. Pass the same
+    `exclude_label_id` you give `reschedule_project`, or out-of-scope work comes
+    back into the plan.
+
+    A parent is never completed by this. When its last open subtask is the one
+    completed, the summary names it and leaves it open. A task that is already
+    done is left alone. Everything is computed before anything is written, and a
+    failure partway reports which writes landed.
+
+    Returns a text summary: the completed task, tasks that became or stopped being
+    ready, tasks that joined or left the critical path, other date changes, and
+    the new finish date with how far it moved.
+    """
+    tz = _zone(timezone)
+    done_on = date.fromisoformat(completed_date) if completed_date else _today(tz)
+    t = await _read_task(task_id)
+    ident = t.get("identifier") or f"#{task_id}"
+    prefix = "Dry run. Nothing was written.\n" if dry_run else ""
+    if t.get("done"):
+        return f"{prefix}{ident} {t.get('title')} is already done. Nothing was changed."
+
+    if actual_start_date:
+        began = date.fromisoformat(actual_start_date)
+        if began > done_on:
+            raise ValueError(
+                f"actual_start_date {began.isoformat()} is after completed_date {done_on.isoformat()}"
+            )
+    else:
+        began = _local_day(t.get("start_date"), tz)
+        if began is None or began > done_on:
+            began = done_on
+    start_at = _stamp(began, _DAY_START, tz).isoformat()
+    end_at = _stamp(done_on, _DAY_END, tz).isoformat()
+
+    project_id = t["project_id"]
+    tasks = await _project_tasks(project_id)
+    r = await _recompute_project(
+        project_id,
+        _today(tz),
+        tz,
+        ready_label_id=ready_label_id,
+        critical_label_id=critical_label_id,
+        exclude_label_id=exclude_label_id,
+        reschedule=reschedule,
+        dry_run=dry_run,
+        tasks=tasks,
+        edited=_with_state(tasks, task_id, True, start_at, end_at),
+        edit=TaskEdit(task_id, {"done": True, "start_date": start_at, "end_date": end_at}, f"done on {ident}"),
+        resume_hint="Run reschedule_project to finish the rest.",
+    )
+    headline = f"{ident} {t.get('title')} — done, {began.isoformat()} → {done_on.isoformat()}"
+    return _status_report(r, tz, task_id, headline, True, reschedule, ready_label_id, critical_label_id, dry_run)
+
+
+@mcp.tool()
+async def reopen_task(
+    task_id: int,
+    reschedule: bool = True,
+    timezone: str = "America/New_York",
+    ready_label_id: int | None = None,
+    critical_label_id: int | None = None,
+    exclude_label_id: int | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Undo a completion: mark a task open again and bring its project up to date.
+
+    For a task closed by mistake. The project is recomputed exactly as
+    `complete_task` does it, from today, and the reopened task is scheduled with
+    the rest when `reschedule` is on. A task that is already open is left alone.
+
+    Returns the same summary `complete_task` does.
+    """
+    tz = _zone(timezone)
+    t = await _read_task(task_id)
+    ident = t.get("identifier") or f"#{task_id}"
+    prefix = "Dry run. Nothing was written.\n" if dry_run else ""
+    if not t.get("done"):
+        return f"{prefix}{ident} {t.get('title')} is already open. Nothing was changed."
+
+    project_id = t["project_id"]
+    tasks = await _project_tasks(project_id)
+    r = await _recompute_project(
+        project_id,
+        _today(tz),
+        tz,
+        ready_label_id=ready_label_id,
+        critical_label_id=critical_label_id,
+        exclude_label_id=exclude_label_id,
+        reschedule=reschedule,
+        dry_run=dry_run,
+        tasks=tasks,
+        edited=_with_state(tasks, task_id, False),
+        edit=TaskEdit(task_id, {"done": False}, f"reopened {ident}"),
+        resume_hint="Run reschedule_project to finish the rest.",
+    )
+    span = _fmt_span(r.after.dates[task_id]) if task_id in r.after.dates and reschedule else "dates unchanged"
+    headline = f"{ident} {t.get('title')} — reopened, {span}"
+    return _status_report(r, tz, task_id, headline, False, reschedule, ready_label_id, critical_label_id, dry_run)
